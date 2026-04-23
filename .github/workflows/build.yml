@@ -6,6 +6,13 @@ on:
     tags:
       - '*'
 
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -14,21 +21,33 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Get variables
+    - name: Get and Validate variables
       run: |
         sed -i 's|\r$||g' variables build.config
         . <(cat variables build.config)
         PADAVAN_THEMES="${PADAVAN_THEMES[*]}"
+        
+        # Validasi: Pastikan variabel penting tidak kosong (Fail-Fast)
+        if [[ -z "$CONFIG_VENDOR" || -z "$CONFIG_FIRMWARE_PRODUCT_ID" ]]; then
+          echo "::error::Critical variables (CONFIG_VENDOR / CONFIG_FIRMWARE_PRODUCT_ID) are missing!"
+          exit 1
+        fi
+
         for v in "${!PADAVAN_@}" "${!CONFIG_@}"; do
-          echo "$v=${!v}" >> $GITHUB_ENV
+          echo "$v=${!v}" >> "$GITHUB_ENV"
         done
 
     - name: Download sources and toolchain
       run: |
+        set -eo pipefail
+        
         git config --global --add safe.directory '*'
         git clone -b "$PADAVAN_BRANCH" "$PADAVAN_REPO"
         git -C padavan-ng checkout "$PADAVAN_COMMIT"
         wget -qO- "$PADAVAN_TOOLCHAIN_URL" | tar -C padavan-ng --zstd -xf -
+
+        PADAVAN_SHORT_COMMIT=$(git -C padavan-ng rev-parse --short HEAD)
+        echo "PADAVAN_SHORT_COMMIT=$PADAVAN_SHORT_COMMIT" >> "$GITHUB_ENV"
 
     - name: Install themes
       run: |
@@ -43,10 +62,17 @@ jobs:
         fi
 
     - name: Run custom pre-build script
-      run: '[[ -f pre-build.sh ]] && . pre-build.sh || :'
+      run: |
+        if [[ -f pre-build.sh ]]; then
+          . pre-build.sh
+        fi
 
     - name: Build firmware
+      id: build_step
       run: |
+        # Mencatat waktu mulai build
+        echo "BUILD_START_TIME=$(date +%s)" >> "$GITHUB_ENV"
+
         cp build.config padavan-ng/trunk/.config
         cd padavan-ng/trunk
         ./clear_tree.sh
@@ -54,35 +80,84 @@ jobs:
 
         FW_FILE_NAME="$(find images -type f -regextype posix-extended -iregex ".*\.(trx|bin)$" \
                         -printf "%T@\t%f\n" | sort -V | tail -1 | cut -f2)"
-        [[ -n $FW_FILE_NAME ]] || { echo "Firmware file not found"; exit 1; }
-        echo "FW_FILE_NAME=$FW_FILE_NAME" >> $GITHUB_ENV
+        
+        if [[ -z "$FW_FILE_NAME" ]]; then
+          echo "::error::Firmware file not found"
+          exit 1
+        fi
+        
+        echo "FW_FILE_NAME=$FW_FILE_NAME" >> "$GITHUB_ENV"
 
     - name: Run custom post-build script
-      run: '[[ -f post-build.sh ]] && . post-build.sh || :'
+      run: |
+        if [[ -f post-build.sh ]]; then
+          . post-build.sh
+        fi
+
+    - name: Check firmware size & Generate Summary
+      run: |
+        partitions=padavan-ng/trunk/configs/boards/$CONFIG_VENDOR/$CONFIG_FIRMWARE_PRODUCT_ID/partitions.config
+        max_fw_size="$(awk '/Firmware/ { getline; getline; sub(",", ""); print strtonum($2); }' "$partitions")"
+        fw_size="$(stat -c %s "padavan-ng/trunk/images/$FW_FILE_NAME")"
+        
+        fw_size_fmtd="$(numfmt --grouping "$fw_size") bytes"
+        max_fw_size_fmtd="$(numfmt --grouping "$max_fw_size") bytes"
+
+        if ((fw_size > max_fw_size)); then
+          echo "::error::Firmware size ($fw_size_fmtd) exceeds max size ($max_fw_size_fmtd) for your target device"
+          exit 1
+        fi
+
+        # Menghitung durasi kompilasi
+        BUILD_END_TIME=$(date +%s)
+        DURATION=$((BUILD_END_TIME - BUILD_START_TIME))
+        MINUTES=$((DURATION / 60))
+        SECONDS=$((DURATION % 60))
+
+        {
+          echo "### 🚀 Firmware Build Successful!"
+          echo "- **Device**: \`${CONFIG_VENDOR} ${CONFIG_FIRMWARE_PRODUCT_ID}\`"
+          echo "- **File Name**: \`$FW_FILE_NAME\`"
+          echo "- **Size**: $fw_size_fmtd (Max: $max_fw_size_fmtd)"
+          echo "- **Padavan Commit**: \`${PADAVAN_SHORT_COMMIT}\`"
+          echo "- **Build Time**: \`${MINUTES}m ${SECONDS}s\` ⏱️"
+        } >> "$GITHUB_STEP_SUMMARY"
 
     - name: Prepare artifacts
       run: |
         cp "padavan-ng/trunk/images/$FW_FILE_NAME" .
-        echo "BUILD_TIMESTAMP=$(date '+%Y.%m.%d_%H.%M.%S')" >> $GITHUB_ENV
+        echo "BUILD_TIMESTAMP=$(date '+%Y.%m.%d_%H.%M.%S')" >> "$GITHUB_ENV"
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: padavan-ng_${{ env.CONFIG_VENDOR }}_${{ env.CONFIG_FIRMWARE_PRODUCT_ID }}_${{ env.BUILD_TIMESTAMP }}
+        name: padavan_${{ env.CONFIG_VENDOR }}_${{ env.CONFIG_FIRMWARE_PRODUCT_ID }}_${{ env.PADAVAN_SHORT_COMMIT }}_${{ env.BUILD_TIMESTAMP }}
         retention-days: 7
         path: |
           ${{ env.FW_FILE_NAME }}
           build.config
+        compression-level: 0
 
-    - name: Check firmware size
-      run: |
-        partitions=padavan-ng/trunk/configs/boards/$CONFIG_VENDOR/$CONFIG_FIRMWARE_PRODUCT_ID/partitions.config
-        max_fw_size="$(awk '/Firmware/ { getline; getline; sub(",", ""); print strtonum($2); }' "$partitions")"
-        fw_size="$(stat -c %s "$FW_FILE_NAME")"
+    # PENINGKATAN: Mengunggah file konfigurasi .config sebagai artifact jika build GAGAL
+    - name: Upload Logs on Failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: failure_logs_${{ env.CONFIG_VENDOR }}_${{ env.CONFIG_FIRMWARE_PRODUCT_ID }}
+        retention-days: 3
+        path: |
+          padavan-ng/trunk/.config
+          build.config
+        compression-level: 9 # Dikompres maksimal untuk teks
 
-        if ((fw_size > max_fw_size)); then
-          fw_size_fmtd="$(numfmt --grouping "$fw_size") bytes"
-          max_fw_size_fmtd="$(numfmt --grouping "$max_fw_size") bytes"
-          echo "Firmware size ($fw_size_fmtd) exceeds max size ($max_fw_size_fmtd) for your target device"
-          exit 1
-        fi
+    - name: Create GitHub Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v2
+      with:
+        name: Firmware Release ${{ github.ref_name }}
+        files: |
+          ${{ env.FW_FILE_NAME }}
+          build.config
+        generate_release_notes: true
+        draft: false
+        prerelease: false
